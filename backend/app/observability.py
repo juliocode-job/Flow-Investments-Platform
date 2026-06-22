@@ -98,25 +98,27 @@ def log_agent_call(
     logger.info(f"Agent Chat Call - User {user_id} - Session {session_id}", extra=extra)
 
     # 2. Langfuse v4 via OpenTelemetry spans
-    if has_langfuse and langfuse_tracer and langfuse_client:
+    if has_langfuse and langfuse_client:
         try:
-            with langfuse_tracer.start_as_current_span("agent-chat-query") as span:
-                # Langfuse v4 OTel attributes
-                span.set_attribute("langfuse.user.id", str(user_id))
-                span.set_attribute("langfuse.session.id", str(session_id) if session_id else "")
-                span.set_attribute("langfuse.observation.name", "agent-chat-query")
-                span.set_attribute("input", query)
-                span.set_attribute("output", response)
-                span.set_attribute("cache_hit", str(cache_hit))
-                span.set_attribute("latency_ms", str(round(latency_ms, 2)))
-
-                # Inner generation span for the LLM call
-                with langfuse_tracer.start_as_current_span("llm-generation") as gen_span:
-                    gen_span.set_attribute("gen_ai.system", "anthropic")
-                    gen_span.set_attribute("gen_ai.request.model", "claude-haiku-4-5" if not cache_hit else "cache-hit")
-                    gen_span.set_attribute("input", query)
-                    gen_span.set_attribute("output", response)
-                    gen_span.set_attribute("latency_ms", str(round(latency_ms, 2)))
+            from langfuse import propagate_attributes
+            with langfuse_client.start_as_current_observation(
+                as_type="span",
+                name="agent-chat-query",
+                input=query,
+                output=response
+            ) as span:
+                with propagate_attributes(
+                    user_id=str(user_id),
+                    session_id=str(session_id) if session_id else ""
+                ):
+                    with langfuse_client.start_as_current_observation(
+                        as_type="generation",
+                        name="llm-generation",
+                        model="claude-haiku-4-5" if not cache_hit else "cache-hit",
+                        input=query,
+                        output=response
+                    ) as gen_span:
+                        pass
 
             # Flush to ensure spans are sent immediately
             langfuse_client.flush()

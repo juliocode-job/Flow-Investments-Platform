@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: flow-db
+    restart: always
+    environment:
+      POSTGRES_USER: flow_user
+      POSTGRES_PASSWORD: secure_password
+      POSTGRES_DB: flow_finance
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  backend:
+    build: ./backend
+    container_name: flow-backend
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://flow_user:secure_password@db:5432/flow_finance
+      - JWT_SECRET=strong_jwt_secret_key
+      - JWT_ALGORITHM=HS256
+      - ANTHROPIC_API_KEY=your_key
+    depends_on:
+      - db
+
+  frontend:
+    build: ./frontend
+    container_name: flow-frontend
+    restart: always
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
