@@ -301,6 +301,17 @@ async def chat_with_agent_stream(
                     if kind == "on_chat_model_stream":
                         content = event["data"]["chunk"].content
                         if content:
+                            if isinstance(content, list):
+                                text = ""
+                                for part in content:
+                                    if isinstance(part, str):
+                                        text += part
+                                    elif isinstance(part, dict) and "text" in part:
+                                        text += part["text"]
+                                content = text
+                            else:
+                                content = str(content)
+                            
                             response_text += content
                             yield content
             else:
