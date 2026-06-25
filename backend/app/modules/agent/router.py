@@ -1,10 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 import time
 import os
+import asyncio
 
 from app.database import get_db, User, ChatSession, ChatMessage
 from app.modules.auth.router import get_current_user
@@ -195,6 +197,157 @@ def chat_with_agent(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error executing agent graph: {str(e)}"
         )
+
+@router.post("/chat/stream")
+async def chat_with_agent_stream(
+    payload: ChatRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Interfaces with the LangGraph agent graph to stream response tokens.
+    Checks cache first, updates persistent chat history in DB, and reports telemetry.
+    """
+    if not payload.messages:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Messages history cannot be empty"
+        )
+        
+    query = payload.messages[-1].content
+    
+    # 1. Fetch or create session
+    if payload.session_id:
+        session = db.query(ChatSession).filter(
+            ChatSession.id == payload.session_id,
+            ChatSession.user_id == current_user.id
+        ).first()
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Sessão não encontrada"
+            )
+    else:
+        words = query.split()
+        title = " ".join(words[:4]) if words else "Nova Conversa"
+        if len(title) > 30:
+            title = title[:27] + "..."
+        session = ChatSession(user_id=current_user.id, title=title)
+        db.add(session)
+        db.commit()
+        db.refresh(session)
+        
+    # 2. Check Cache
+    start_time = time.time()
+    cached_response = get_cached_response(db, current_user.id, query)
+    
+    async def event_generator():
+        # Yield session ID first so frontend knows it
+        yield f"SESSION_ID:{session.id}\n"
+        
+        if cached_response:
+            # Simulate streaming of cached response in chunks
+            words = cached_response.split(" ")
+            for i, word in enumerate(words):
+                space = " " if i > 0 else ""
+                yield space + word
+                await asyncio.sleep(0.02)
+                
+            latency_ms = (time.time() - start_time) * 1000
+            
+            # Save messages to db
+            user_msg = ChatMessage(session_id=session.id, role="user", content=query)
+            ai_msg = ChatMessage(session_id=session.id, role="assistant", content=cached_response)
+            db.add_all([user_msg, ai_msg])
+            db.commit()
+            
+            log_agent_call(
+                user_id=current_user.id,
+                query=query,
+                response=cached_response,
+                latency_ms=latency_ms,
+                cache_hit=True,
+                session_id=session.id
+            )
+            return
+
+        # Convert incoming schemas to LangChain message formats
+        formatted_messages = []
+        for msg in payload.messages:
+            if msg.role == "user":
+                formatted_messages.append(HumanMessage(content=msg.content))
+            elif msg.role == "assistant":
+                formatted_messages.append(AIMessage(content=msg.content))
+                
+        langfuse_handler = _make_langfuse_handler(current_user.id, session.id)
+        callbacks = [langfuse_handler] if langfuse_handler else []
+        config = {
+            "configurable": {
+                "thread_id": f"user_thread_{current_user.id}_{session.id}",
+                "user_id": current_user.id
+            },
+            "callbacks": callbacks,
+            "run_name": f"Flow Agent Stream | session:{session.id}",
+            "tags": ["flow-investment", "agent-chat-stream"],
+        }
+        
+        response_text = ""
+        try:
+            from .graph import has_llm_key
+            if has_llm_key:
+                # Use standard LangGraph events streaming
+                async for event in agent_graph.astream_events({"messages": formatted_messages}, config=config, version="v2"):
+                    kind = event["event"]
+                    if kind == "on_chat_model_stream":
+                        content = event["data"]["chunk"].content
+                        if content:
+                            response_text += content
+                            yield content
+            else:
+                # Mock Mode: stream mock responder node content chunk by chunk
+                # Invoke graph synchronously to get the output, then stream it
+                result = agent_graph.invoke({"messages": formatted_messages}, config=config)
+                output_messages = result.get("messages", [])
+                mock_text = "Não consegui processar a resposta."
+                if output_messages:
+                    for msg in reversed(output_messages):
+                        if isinstance(msg, AIMessage) and msg.content:
+                            mock_text = msg.content
+                            break
+                # Stream the mock text chunk by chunk
+                words = mock_text.split(" ")
+                for i, word in enumerate(words):
+                    space = " " if i > 0 else ""
+                    chunk = space + word
+                    response_text += chunk
+                    yield chunk
+                    await asyncio.sleep(0.03)
+
+            latency_ms = (time.time() - start_time) * 1000
+            
+            # Save messages to db
+            user_msg = ChatMessage(session_id=session.id, role="user", content=query)
+            ai_msg = ChatMessage(session_id=session.id, role="assistant", content=response_text)
+            db.add_all([user_msg, ai_msg])
+            
+            # Save to cache
+            set_cache_response(db, current_user.id, query, response_text)
+            db.commit()
+            
+            # Log structured call
+            log_agent_call(
+                user_id=current_user.id,
+                query=query,
+                response=response_text,
+                latency_ms=latency_ms,
+                cache_hit=False,
+                session_id=session.id
+            )
+        except Exception as e:
+            db.rollback()
+            yield f"\n[ERROR: {str(e)}]"
+            
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @router.get("/sessions", response_model=List[Dict[str, Any]])
 def get_sessions(

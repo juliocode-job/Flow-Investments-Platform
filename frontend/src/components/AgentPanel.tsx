@@ -117,22 +117,77 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({ isOpen, onToggle, refres
     setLoading(true);
 
     try {
-      // Send message history along with active session_id
-      const response = await api.post('/agent/chat', {
-        messages: [...messages, { role: 'user', content: userMessage }],
-        session_id: activeSessionId
-      });
+      const apiBase = (import.meta.env.VITE_API_URL as string) || 'http://localhost:8000';
+      const token = localStorage.getItem('flow_token');
       
-      setMessages(prev => [
-        ...prev,
-        { role: 'assistant', content: response.data.response }
-      ]);
+      const response = await fetch(`${apiBase}/agent/chat/stream`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': token ? `Bearer ${token}` : '',
+        },
+        body: JSON.stringify({
+          messages: [...messages, { role: 'user', content: userMessage }],
+          session_id: activeSessionId
+        })
+      });
 
-      if (!activeSessionId) {
-        setActiveSessionId(response.data.session_id);
-        fetchSessions();
+      if (!response.ok) {
+        throw new Error('Failed to fetch from streaming endpoint');
       }
+
+      if (!response.body) {
+        throw new Error('No response body for streaming');
+      }
+
+      // Add a placeholder message for the assistant that we will append tokens to
+      setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let done = false;
+      let fullText = '';
+      let isFirstChunk = true;
+
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
+        if (value) {
+          const chunk = decoder.decode(value, { stream: !done });
+          
+          if (isFirstChunk) {
+            isFirstChunk = false;
+            // The backend sends "SESSION_ID:X\n" as the first line of the stream
+            const lines = chunk.split('\n');
+            const sessionLine = lines.find(l => l.startsWith('SESSION_ID:'));
+            if (sessionLine) {
+              const sessId = parseInt(sessionLine.split(':')[1], 10);
+              if (sessId && sessId !== activeSessionId) {
+                setActiveSessionId(sessId);
+                fetchSessions();
+              }
+              const actualContent = lines.filter(l => !l.startsWith('SESSION_ID:')).join('\n');
+              fullText += actualContent;
+            } else {
+              fullText += chunk;
+            }
+          } else {
+            fullText += chunk;
+          }
+
+          // Update the content of the last message in state
+          setMessages(prev => {
+            const updated = [...prev];
+            if (updated.length > 0) {
+              updated[updated.length - 1] = { role: 'assistant', content: fullText };
+            }
+            return updated;
+          });
+        }
+      }
+
     } catch (err: any) {
+      console.error(err);
       setMessages(prev => [
         ...prev,
         {
