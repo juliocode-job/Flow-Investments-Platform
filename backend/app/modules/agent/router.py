@@ -11,7 +11,7 @@ import asyncio
 from app.database import get_db, User, ChatSession, ChatMessage
 from app.modules.auth.router import get_current_user
 from app.modules.agent.cache import get_cached_response, set_cache_response
-from app.observability import log_agent_call
+from app.observability import log_agent_call, langfuse_client, has_langfuse
 from app.config import settings
 from .graph import agent_graph
 
@@ -149,7 +149,20 @@ def chat_with_agent(
     
     try:
         # Run graph
-        result = agent_graph.invoke({"messages": formatted_messages}, config=config)
+        if has_langfuse and langfuse_client:
+            from langfuse import propagate_attributes
+            with langfuse_client.start_as_current_observation(
+                as_type="span",
+                name="agent-chat-query",
+                input=query
+            ) as parent_span:
+                with propagate_attributes(
+                    user_id=str(current_user.id),
+                    session_id=str(session.id)
+                ):
+                    result = agent_graph.invoke({"messages": formatted_messages}, config=config)
+        else:
+            result = agent_graph.invoke({"messages": formatted_messages}, config=config)
         
         # Extract the last message (which should be the AI response)
         output_messages = result.get("messages", [])
@@ -300,45 +313,66 @@ async def chat_with_agent_stream(
         response_text = ""
         try:
             from .graph import has_llm_key
-            if has_llm_key:
-                # Use standard LangGraph events streaming
-                async for event in agent_graph.astream_events({"messages": formatted_messages}, config=config, version="v2"):
-                    kind = event["event"]
-                    if kind == "on_chat_model_stream":
-                        content = event["data"]["chunk"].content
-                        if content:
-                            if isinstance(content, list):
-                                text = ""
-                                for part in content:
-                                    if isinstance(part, str):
-                                        text += part
-                                    elif isinstance(part, dict) and "text" in part:
-                                        text += part["text"]
-                                content = text
-                            else:
-                                content = str(content)
-                            
-                            response_text += content
-                            yield content
+            
+            async def run_streaming_flow():
+                nonlocal response_text
+                if has_llm_key:
+                    # Use standard LangGraph events streaming
+                    async for event in agent_graph.astream_events({"messages": formatted_messages}, config=config, version="v2"):
+                        kind = event["event"]
+                        if kind == "on_chat_model_stream":
+                            content = event["data"]["chunk"].content
+                            if content:
+                                if isinstance(content, list):
+                                    text = ""
+                                    for part in content:
+                                        if isinstance(part, str):
+                                            text += part
+                                        elif isinstance(part, dict) and "text" in part:
+                                            text += part["text"]
+                                    content = text
+                                else:
+                                    content = str(content)
+                                
+                                response_text += content
+                                yield content
+                else:
+                    # Mock Mode: stream mock responder node content chunk by chunk
+                    # Invoke graph synchronously to get the output, then stream it
+                    result = agent_graph.invoke({"messages": formatted_messages}, config=config)
+                    output_messages = result.get("messages", [])
+                    mock_text = "Não consegui processar a resposta."
+                    if output_messages:
+                        for msg in reversed(output_messages):
+                            if isinstance(msg, AIMessage) and msg.content:
+                                mock_text = msg.content
+                                break
+                    # Stream the mock text chunk by chunk
+                    words = mock_text.split(" ")
+                    for i, word in enumerate(words):
+                        space = " " if i > 0 else ""
+                        chunk = space + word
+                        response_text += chunk
+                        yield chunk
+                        await asyncio.sleep(0.03)
+
+            # Wrap async generator iteration in the parent observation if enabled
+            if has_langfuse and langfuse_client:
+                from langfuse import propagate_attributes
+                with langfuse_client.start_as_current_observation(
+                    as_type="span",
+                    name="agent-chat-query",
+                    input=query
+                ) as parent_span:
+                    with propagate_attributes(
+                        user_id=str(current_user.id),
+                        session_id=str(session.id)
+                    ):
+                        async for chunk in run_streaming_flow():
+                            yield chunk
             else:
-                # Mock Mode: stream mock responder node content chunk by chunk
-                # Invoke graph synchronously to get the output, then stream it
-                result = agent_graph.invoke({"messages": formatted_messages}, config=config)
-                output_messages = result.get("messages", [])
-                mock_text = "Não consegui processar a resposta."
-                if output_messages:
-                    for msg in reversed(output_messages):
-                        if isinstance(msg, AIMessage) and msg.content:
-                            mock_text = msg.content
-                            break
-                # Stream the mock text chunk by chunk
-                words = mock_text.split(" ")
-                for i, word in enumerate(words):
-                    space = " " if i > 0 else ""
-                    chunk = space + word
-                    response_text += chunk
+                async for chunk in run_streaming_flow():
                     yield chunk
-                    await asyncio.sleep(0.03)
 
             latency_ms = (time.time() - start_time) * 1000
             
