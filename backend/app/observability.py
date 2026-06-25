@@ -76,13 +76,12 @@ def log_agent_call(
     session_id: Optional[int] = None
 ) -> None:
     """
-    Logs structured OTel-compatible information to stdout and sends a
-    span to Langfuse v4 via OpenTelemetry if configured.
+    Logs structured OTel-compatible information to stdout.
     """
     trace_id = uuid.uuid4().hex
     span_id = uuid.uuid4().hex[16:]
 
-    # 1. Structured stdout logging
+    # Structured stdout logging
     extra = {
         "trace_id": trace_id,
         "span_id": span_id,
@@ -96,31 +95,3 @@ def log_agent_call(
         }
     }
     logger.info(f"Agent Chat Call - User {user_id} - Session {session_id}", extra=extra)
-
-    # 2. Langfuse v4 via OpenTelemetry spans
-    if has_langfuse and langfuse_client:
-        try:
-            from langfuse import propagate_attributes
-            with langfuse_client.start_as_current_observation(
-                as_type="span",
-                name="agent-chat-query",
-                input=query,
-                output=response
-            ) as span:
-                with propagate_attributes(
-                    user_id=str(user_id),
-                    session_id=str(session_id) if session_id else ""
-                ):
-                    with langfuse_client.start_as_current_observation(
-                        as_type="generation",
-                        name="llm-generation",
-                        model="claude-haiku-4-5" if not cache_hit else "cache-hit",
-                        input=query,
-                        output=response
-                    ) as gen_span:
-                        pass
-
-            # Flush to ensure spans are sent immediately
-            langfuse_client.flush()
-        except Exception as e:
-            sys.stderr.write(f"[Observability Warning] Failed to send span to Langfuse: {e}\n")

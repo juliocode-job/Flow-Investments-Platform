@@ -186,6 +186,12 @@ def chat_with_agent(
             session_id=session.id
         )
         
+        if langfuse_handler:
+            try:
+                langfuse_handler.flush()
+            except Exception:
+                pass
+        
         return ChatResponse(
             response=response_text,
             session_id=session.id
@@ -354,6 +360,13 @@ async def chat_with_agent_stream(
                 cache_hit=False,
                 session_id=session.id
             )
+            
+            # Flush Langfuse telemetry trace to ensure it is sent
+            if langfuse_handler:
+                try:
+                    langfuse_handler.flush()
+                except Exception:
+                    pass
         except Exception as e:
             db.rollback()
             yield f"\n[ERROR: {str(e)}]"
